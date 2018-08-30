@@ -50,14 +50,19 @@ def mask_attn_weights(w):
     return w
 
 
-def _attn(q, k, v, sequence_lens, pdrop):
+def _attn(q, k, v, sequence_lens, pdrop, mask):
     w = tf.matmul(q, k)
     shape = shape_list(v)
     n_state = shape[-1]
     seq_len = shape[-2]
     w = w * tf.rsqrt(tf.cast(n_state, tf.float32))
-    w *= tf.expand_dims(tf.expand_dims(tf.sequence_mask(sequence_lens, maxlen=seq_len, dtype=tf.float32),
-                        axis=1), axis=1)
+
+    if sequence_lens is not None:
+        w *= tf.expand_dims(tf.expand_dims(tf.sequence_mask(sequence_lens, maxlen=seq_len, dtype=tf.float32),
+                                           axis=1), axis=1)
+    if mask:
+        w = mask_attn_weights(w)
+
     w = tf.nn.softmax(w)
     w = dropout(w, pdrop)
     a = tf.matmul(w, v)
@@ -98,10 +103,10 @@ def conv1d(x, scope, nf, rf, w_init=tf.random_normal_initializer(stddev=0.02), b
             c = tf.reshape(tf.matmul(tf.reshape(x, [-1, nx]), tf.reshape(w, [-1, nf])) + b, shape_list(x)[:-1] + [nf])
         else:  # was used to train LM
             c = tf.nn.conv1d(x, w, stride=1, padding=pad) + b
-        return c
+    return c
 
 
-def attn(x, scope, n_state, n_head, pdrop, sequence_lens):
+def attn(x, scope, n_state, n_head, pdrop, sequence_lens, mask):
     assert n_state % n_head == 0
     with tf.variable_scope(scope):
         c = conv1d(x, 'c_attn', n_state * 3, 1)
@@ -109,11 +114,69 @@ def attn(x, scope, n_state, n_head, pdrop, sequence_lens):
         q = split_heads(q, n_head)
         k = split_heads(k, n_head, k=True)
         v = split_heads(v, n_head)
-        a = _attn(q, k, v, sequence_lens, pdrop=pdrop)
+        a = _attn(q, k, v, sequence_lens, pdrop=pdrop, mask=mask)
         a = merge_heads(a)
         a = conv1d(a, 'c_proj', n_state, 1)
         a = dropout(a, pdrop)
-        return a
+    return a
+
+
+def cond_attn(x, cond, scope, n_state, n_head, pdrop, sequence_lens, mask):
+    assert n_state % n_head == 0
+    with tf.variable_scope(scope):
+        c = conv1d(x, 'c_attn', n_state * 2, 1)
+        q, k, v = tf.split(c, 2, 2)
+        q = split_heads(q, n_head)
+        v = split_heads(v, n_head)
+
+        c = conv1d(tf.expand_dims(cond, dim=1), 'c_attn', n_state * 1, 1)
+        k = split_heads(c, n_head, k=True)
+
+        a = _attn(q, k, v, sequence_lens, pdrop=pdrop, mask=mask)
+        a = merge_heads(a)
+        a = conv1d(a, 'c_proj', n_state, 1)
+        a = dropout(a, pdrop)
+    return a
+
+
+def decoder(x, targets, cond, embeddings, bias, n_head, n_block, pdrop, sequence_lens, vocab_size, num_sampled):
+    """
+
+    :param x: embedded input
+    :param targets: target ids
+    :param cond:
+    :param embeddings:
+    :param bias:
+    :param n_head:
+    :param n_block:
+    :param pdrop:
+    :param sequence_lens:
+    :return:
+    """
+    targets = targets[:, 1:]
+    x = add_timing_signal_1d(x[:, :-1, :])
+
+    for i in range(n_block):
+        x = decoder_block(x, cond, n_head, None, pdrop, "decoder_block_{}".format(i))
+
+    shape = shape_list(x)
+    seq_len = shape[1]
+
+    loss_mask = tf.reshape(tf.sequence_mask(sequence_lens, maxlen=seq_len, dtype=tf.float32), shape=[-1])
+    loss = tf.nn.sampled_softmax_loss(
+        tf.reshape(embeddings, shape=[-1, shape[-1]]),
+        bias,
+        tf.reshape(targets, shape=[-1]),
+        x,
+        num_sampled,
+        vocab_size,
+        num_true=1,
+        remove_accidental_hits=True,
+        partition_strategy='div',
+        name='reconstruction_loss',
+    )
+    loss = (loss_mask * loss) / tf.reduce_sum(loss_mask)
+    return loss
 
 
 def mlp(x, scope, n_state, pdrop, nx=None):
@@ -122,17 +185,29 @@ def mlp(x, scope, n_state, pdrop, nx=None):
         h = tf.nn.relu(conv1d(x, 'c_fc', n_state, 1))
         h2 = conv1d(h, 'c_proj', nx, 1)
         h2 = dropout(h2, pdrop)
-        return h2
+    return h2
 
 
 def block(x, n_head, sequence_lens, pdrop, scope):
     with tf.variable_scope(scope):
         nx = shape_list(x)[-1]
-        a = attn(x, 'attn', nx, n_head, pdrop, sequence_lens)
+        a = attn(x, 'attn', nx, n_head, pdrop, sequence_lens, mask=False)
         n = norm(x + a, 'ln_1')
         m = mlp(n, 'mlp', nx * 4, pdrop)
         h = norm(n + m, 'ln_2')
-        return h
+    return h
+
+
+def decoder_block(x, cond, n_head, sequence_lens, pdrop, scope):
+    with tf.variable_scope(scope):
+        nx = shape_list(x)[-1]
+        a = attn(x, 'attn', nx, n_head, pdrop, sequence_lens, mask=True)
+        n = norm(x + a, 'ln_1')
+        a = cond_attn(n, 'attn', nx, cond, n_head, pdrop, sequence_lens, mask=True)
+        n = norm(n + a, 'ln_2')
+        m = mlp(n, 'mlp', nx * 4, pdrop)
+        h = norm(n + m, 'ln_3')
+    return h
 
 
 def add_timing_signal_1d(x,
