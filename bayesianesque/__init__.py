@@ -1,0 +1,1 @@
+from bayesianesque.estimator import EmbedModel

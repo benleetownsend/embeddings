@@ -124,13 +124,14 @@ def attn(x, scope, n_state, n_head, pdrop, sequence_lens, mask):
 def cond_attn(x, cond, scope, n_state, n_head, pdrop, sequence_lens, mask):
     assert n_state % n_head == 0
     with tf.variable_scope(scope):
-        c = conv1d(x, 'c_attn', n_state * 2, 1)
-        q, k, v = tf.split(c, 2, 2)
-        q = split_heads(q, n_head)
+        c = conv1d(x, 'c_attn_qv', n_state * 2, 1)
+        q, v = tf.split(c, 2, 2)
+        k = split_heads(q, n_head, k=True)
         v = split_heads(v, n_head)
 
-        c = conv1d(tf.expand_dims(cond, dim=1), 'c_attn', n_state * 1, 1)
-        k = split_heads(c, n_head, k=True)
+        c = conv1d(tf.expand_dims(cond, dim=1), 'c_attn_k', n_state * 1, 1)
+        # c = tf.tile(c, [1, shape_list(x)[1], 1])
+        q = split_heads(c, n_head)
 
         a = _attn(q, k, v, sequence_lens, pdrop=pdrop, mask=mask)
         a = merge_heads(a)
@@ -163,11 +164,12 @@ def decoder(x, targets, cond, embeddings, bias, n_head, n_block, pdrop, sequence
     seq_len = shape[1]
 
     loss_mask = tf.reshape(tf.sequence_mask(sequence_lens, maxlen=seq_len, dtype=tf.float32), shape=[-1])
+
     loss = tf.nn.sampled_softmax_loss(
-        tf.reshape(embeddings, shape=[-1, shape[-1]]),
+        embeddings,
         bias,
-        tf.reshape(targets, shape=[-1]),
-        x,
+        tf.reshape(targets, shape=[-1, 1]),
+        tf.reshape(x, shape=[-1, shape[-1]]),
         num_sampled,
         vocab_size,
         num_true=1,
@@ -176,7 +178,7 @@ def decoder(x, targets, cond, embeddings, bias, n_head, n_block, pdrop, sequence
         name='reconstruction_loss',
     )
     loss = (loss_mask * loss) / tf.reduce_sum(loss_mask)
-    return loss
+    return tf.reduce_sum(loss)
 
 
 def mlp(x, scope, n_state, pdrop, nx=None):
@@ -203,7 +205,7 @@ def decoder_block(x, cond, n_head, sequence_lens, pdrop, scope):
         nx = shape_list(x)[-1]
         a = attn(x, 'attn', nx, n_head, pdrop, sequence_lens, mask=True)
         n = norm(x + a, 'ln_1')
-        a = cond_attn(n, 'attn', nx, cond, n_head, pdrop, sequence_lens, mask=True)
+        a = cond_attn(n, cond, 'cond_attn', nx, n_head, pdrop, sequence_lens, mask=True)
         n = norm(n + a, 'ln_2')
         m = mlp(n, 'mlp', nx * 4, pdrop)
         h = norm(n + m, 'ln_3')
@@ -228,3 +230,18 @@ def add_timing_signal_1d(x,
     signal = tf.pad(signal, [[0, 0], [0, tf.mod(channels, 2)]])
     signal = tf.reshape(signal, [1, length, channels])
     return signal + x
+
+
+def class_reweighting(class_weights):
+    @tf.custom_gradient
+    def custom_grad(logits):
+        def grad(g):
+            return g * class_weights
+
+        return tf.identity(logits), grad
+
+    return custom_grad
+
+
+def noam_lr(lr, hidden_dim, global_step, warmup_steps):
+    return lr * (hidden_dim ** (-0.5) * tf.minimum(tf.pow(tf.to_float(global_step), -0.5), tf.to_float(global_step) * tf.pow(tf.to_float(warmup_steps), -1.5)))
